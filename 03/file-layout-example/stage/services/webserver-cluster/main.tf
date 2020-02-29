@@ -2,6 +2,17 @@ terraform {
   required_version = ">= 0.12, < 0.13"
 }
 
+terraform {
+  backend "s3" {
+    bucket = "bp-terraform-up-and-running-state"
+    key    = "stage/services/webserver-cluster/terraform.tfstate"
+    region = "us-east-2"
+
+    dynamodb_table = "terraform-up-and-running-locks"
+    encrypt        = true
+  }
+}
+
 provider "aws" {
   region = "us-east-2"
 
@@ -13,17 +24,22 @@ resource "aws_launch_configuration" "example" {
   image_id        = "ami-0c55b159cbfafe1f0"
   instance_type   = "t2.micro"
   security_groups = [aws_security_group.instance.id]
-
-  user_data = <<-EOF
-              #!/bin/bash
-              echo "Hello, World" > index.html
-              nohup busybox httpd -f -p ${var.server_port} &
-              EOF
+  user_data       = data.template_file.user_data.rendered
 
   # Required when using a launch configuration with an auto scaling group.
   # https://www.terraform.io/docs/providers/aws/r/launch_configuration.html
   lifecycle {
     create_before_destroy = true
+  }
+}
+
+data "template_file" "user_data" {
+  template = file("user-data.sh")
+
+  vars = {
+    server_port = var.server_port
+    db_address  = data.terraform_remote_state.db.outputs.address
+    db_port     = data.terraform_remote_state.db.outputs.port
   }
 }
 
@@ -34,8 +50,8 @@ resource "aws_autoscaling_group" "example" {
   target_group_arns = [aws_lb_target_group.asg.arn]
   health_check_type = "ELB"
 
-  min_size = 2
-  max_size = 10
+  min_size = 1
+  max_size = 2
 
   tag {
     key                 = "Name"
@@ -55,18 +71,8 @@ resource "aws_security_group" "instance" {
   }
 }
 
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnet_ids" "default" {
-  vpc_id = data.aws_vpc.default.id
-}
-
 resource "aws_lb" "example" {
-
-  name = var.alb_name
-
+  name               = var.alb_name
   load_balancer_type = "application"
   subnets            = data.aws_subnet_ids.default.ids
   security_groups    = [aws_security_group.alb.id]
@@ -90,9 +96,7 @@ resource "aws_lb_listener" "http" {
 }
 
 resource "aws_lb_target_group" "asg" {
-
-  name = var.alb_name
-
+  name     = var.alb_name
   port     = var.server_port
   protocol = "HTTP"
   vpc_id   = data.aws_vpc.default.id
@@ -113,8 +117,9 @@ resource "aws_lb_listener_rule" "asg" {
   priority     = 100
 
   condition {
-    field  = "path-pattern"
-    values = ["*"]
+    path_pattern {
+      values = ["*"]
+    }
   }
 
   action {
@@ -124,7 +129,6 @@ resource "aws_lb_listener_rule" "asg" {
 }
 
 resource "aws_security_group" "alb" {
-
   name = var.alb_security_group_name
 
   # Allow inbound HTTP requests
@@ -144,3 +148,20 @@ resource "aws_security_group" "alb" {
   }
 }
 
+data "terraform_remote_state" "db" {
+  backend = "s3"
+
+  config = {
+    bucket = var.db_remote_state_bucket
+    key    = var.db_remote_state_key
+    region = "us-east-2"
+  }
+}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnet_ids" "default" {
+  vpc_id = data.aws_vpc.default.id
+}
